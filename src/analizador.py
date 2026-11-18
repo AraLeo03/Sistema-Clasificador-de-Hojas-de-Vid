@@ -64,6 +64,10 @@ def cargar_config():
 
         GEMINI_API_KEY, GEMINI_MODEL, GEMINI_MODELOS_RESPALDO
         ANTHROPIC_API_KEY, CLAUDE_MODEL, CLAUDE_MODELOS_RESPALDO
+        CLAUDE_EJECUTAR_CODIGO    true/false: Claude escribe y EJECUTA codigo Python (herramienta de
+                                  ejecucion de codigo de la API) para medir la escala de la cuadricula.
+        CLAUDE_CODIGO_TIMEOUT_SEGUNDOS   espera maxima en ese modo (por defecto 180).
+        CLAUDE_TOOL_CODIGO        version de la herramienta (por defecto code_execution_20250825).
 
     Devuelve un diccionario con:
         proveedores  lista ORDENADA [{"nombre", "api_key", "modelos"}, ...]: principal primero
@@ -166,7 +170,7 @@ def encontrar_archivos(carpeta):
 
 
 # ======================================================================
-# 2. CALCULO LOCAL (para comparar contra Gemini)
+# 2. CALCULO LOCAL (para comparar contra LLM)
 # ======================================================================
 
 def vector(puntos, linea):
@@ -198,7 +202,7 @@ def calcular_local(puntos, escala_px_cm=None):
 
 
 # ======================================================================
-# 3. ARMADO DEL MENSAJE Y LLAMADA A GEMINI
+# 3. ARMADO DEL MENSAJE Y LLAMADA A LLM
 # ======================================================================
 
 def armar_texto_usuario(texto_coordenadas, hay_imagen_limpia):
@@ -252,6 +256,105 @@ def llamar_gemini(api_key, modelos, contexto, texto_usuario, rutas_imagenes, tim
     raise RuntimeError("Ningun modelo de Gemini respondio:\n  " + "\n  ".join(errores))
 
 
+def _claude_usa_codigo():
+    """True si el .env activa CLAUDE_EJECUTAR_CODIGO (Claude escribe y ejecuta codigo para medir la escala)."""
+    valor = os.environ.get("CLAUDE_EJECUTAR_CODIGO", "false")
+    return str(valor).strip().lower() in ("1", "true", "si", "sí", "yes", "on")
+
+
+INSTRUCCION_CODIGO = (
+    "\n\nHERRAMIENTA DE CODIGO ACTIVADA: tienes un entorno Python con las imagenes adjuntas como archivos "
+    "({nombres}); si no las ves, buscalas con ls o find. "
+    "Para obtener la escala NO la estimes a ojo: escribe y EJECUTA codigo (OpenCV, NumPy, SciPy) que mida "
+    "el periodo de la cuadricula en pixeles, de preferencia sobre la imagen SIN puntos (*_vertical.jpg) y "
+    "evitando la zona de la hoja. Calcula la escala horizontal y la vertical por separado y comprueba que "
+    "sean coherentes; si no lo son, dilo en las advertencias. "
+    "Tu respuesta FINAL debe seguir el formato del archivo de contexto: unicamente el bloque "
+    "INICIO_RESULTADOS ... FIN_RESULTADOS."
+)
+
+
+def _extraer_ejecucion(contenido):
+    """Devuelve el codigo/comandos que Claude ejecuto y lo que imprimieron (para auditar y reproducir)."""
+    partes = []
+    for b in contenido:
+        if b.type == "server_tool_use":
+            entrada = b.input or {}
+            if b.name == "bash_code_execution":
+                codigo = entrada.get("command") or ""
+            else:                                   # text_editor_code_execution: archivos que creo
+                codigo = entrada.get("file_text") or ""
+            if codigo.strip():
+                partes.append(f"# --- {b.name} ---\n{codigo}")
+        elif b.type == "bash_code_execution_tool_result":
+            r = b.content
+            salida = (getattr(r, "stdout", "") or "") + (getattr(r, "stderr", "") or "")
+            if salida.strip():
+                partes.append("# >>> salida:\n" + "".join(f"# {l}\n" for l in salida.splitlines()))
+    return partes
+
+
+def _llamar_claude_con_codigo(cliente, modelos, contexto, texto_usuario, rutas_imagenes):
+    """Claude con la herramienta de ejecucion de codigo: sube las imagenes a la Files API, deja que
+    escriba y ejecute codigo para medir la escala y devuelve (modelo, texto) igual que llamar_claude.
+
+    Guarda el codigo que ejecuto en <carpeta de la hoja>/codigo_escala_claude.py.
+    """
+    herramienta = {"type": os.environ.get("CLAUDE_TOOL_CODIGO", "").strip() or "code_execution_20250825",
+                   "name": "code_execution"}
+    timeout = float(os.environ.get("CLAUDE_CODIGO_TIMEOUT_SEGUNDOS", "").strip() or 180)
+    cliente = cliente.with_options(timeout=timeout)       # ejecutar codigo tarda mas que una llamada normal
+    carpeta = Path(rutas_imagenes[0]).parent
+
+    # Las imagenes van dos veces: en base64 (para que Claude las vea) y subidas a la Files API
+    # como container_upload (para que el codigo pueda abrirlas con OpenCV).
+    contenido, ids_archivos = [], []
+    for ruta in rutas_imagenes:
+        datos = base64.standard_b64encode(Path(ruta).read_bytes()).decode("ascii")
+        contenido.append({"type": "image",
+                          "source": {"type": "base64", "media_type": "image/jpeg", "data": datos}})
+        ids_archivos.append(cliente.beta.files.upload(file=Path(ruta)).id)
+    for id_archivo in ids_archivos:
+        contenido.append({"type": "container_upload", "file_id": id_archivo})
+    nombres = ", ".join(Path(r).name for r in rutas_imagenes)
+    contenido.append({"type": "text",
+                      "text": texto_usuario + INSTRUCCION_CODIGO.format(nombres=nombres)})
+
+    errores = []
+    for modelo in modelos:
+        try:
+            mensajes = [{"role": "user", "content": contenido}]
+            extra, codigo = {}, []
+            for _ in range(6):                             # un turno largo puede pausarse (pause_turn)
+                respuesta = cliente.beta.messages.create(
+                    model=modelo,
+                    max_tokens=8000,                       # el codigo que escribe tambien cuenta
+                    system=contexto,
+                    thinking={"type": "disabled"},
+                    betas=["files-api-2025-04-14"],
+                    tools=[herramienta],
+                    messages=mensajes,
+                    **extra,
+                )
+                codigo.extend(_extraer_ejecucion(respuesta.content))
+                if respuesta.stop_reason != "pause_turn":
+                    break
+                mensajes.append({"role": "assistant", "content": respuesta.content})
+                if getattr(respuesta, "container", None):
+                    extra["container"] = respuesta.container.id
+
+            texto = "".join(b.text for b in respuesta.content if b.type == "text")
+            print("stop_reason:", respuesta.stop_reason, f"| bloques de codigo ejecutados: {len(codigo)}")
+            # if codigo:
+            #     (carpeta / "codigo_escala_claude.py").write_text("\n\n".join(codigo), encoding="utf-8")
+            return f"{modelo}+codigo", texto               # '+codigo' queda registrado en medidas_hojas.csv
+        except Exception as error:  # modelo inexistente, saturado, timeout, cuota...
+            print(f"  Fallo el modelo {modelo} (con codigo): {error}")
+            errores.append(f"{modelo}: {error}")
+
+    raise RuntimeError("Ningun modelo de Claude respondio (modo codigo):\n  " + "\n  ".join(errores))
+
+
 def llamar_claude(api_key, modelos, contexto, texto_usuario, rutas_imagenes, timeout_s=60):
     """Igual que llamar_gemini pero con la API de Claude (Messages API).
 
@@ -265,6 +368,10 @@ def llamar_claude(api_key, modelos, contexto, texto_usuario, rutas_imagenes, tim
         raise RuntimeError("Falta la libreria: pip install -U anthropic")
 
     cliente = anthropic.Anthropic(api_key=api_key, timeout=timeout_s)   # timeout en segundos
+
+    # CLAUDE_EJECUTAR_CODIGO=true en el .env: Claude escribe y ejecuta codigo para medir la escala.
+    if _claude_usa_codigo():
+        return _llamar_claude_con_codigo(cliente, modelos, contexto, texto_usuario, rutas_imagenes)
 
     contenido = []
     for ruta in rutas_imagenes:
